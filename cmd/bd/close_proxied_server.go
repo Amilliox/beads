@@ -36,42 +36,70 @@ type closeProxiedOutcome struct {
 }
 
 func runCloseProxiedServer(cmd *cobra.Command, ctx context.Context, args []string) {
+	in, reasons, err := parseCloseProxiedArgs(cmd, args)
+	if err != nil {
+		FatalErrorRespectJSON("%v", err)
+	}
+
+	uw, err := openCloseProxiedUOW(ctx)
+	if err != nil {
+		FatalErrorRespectJSON("%v", err)
+	}
+	defer uw.Close(ctx)
+
+	outcomes, closedIssues := processCloseProxiedIssues(ctx, uw, args, reasons, in)
+	unblocked, continueResult, claimedNextIssue := processCloseProxiedPostActions(ctx, uw, args, outcomes, in)
+
+	commitCloseProxiedWithHooks(ctx, uw, outcomes, claimedNextIssue, continueResult)
+	renderCloseProxiedOutput(outcomes, closedIssues, unblocked, continueResult, claimedNextIssue, in)
+
+	if len(args) > 0 && len(outcomes) == 0 {
+		os.Exit(1)
+	}
+}
+
+func parseCloseProxiedArgs(cmd *cobra.Command, args []string) (*closeProxiedInput, []string, error) {
 	if len(args) == 0 {
-		FatalErrorRespectJSON("no issue ID provided")
+		return nil, nil, fmt.Errorf("no issue ID provided")
 	}
 
 	reasons, updatedArgs, err := resolveCloseReasons(cmd, args)
 	if err != nil {
-		FatalErrorRespectJSON("%v", err)
+		return nil, nil, err
 	}
-	args = updatedArgs
 	if err := validateCloseReasons(reasons); err != nil {
-		FatalErrorRespectJSON("%v", err)
+		return nil, nil, err
 	}
 
 	in := gatherCloseProxiedInput(cmd)
+	args = updatedArgs
 
 	if in.continueOn && len(args) > 1 {
-		FatalErrorRespectJSON("--continue only works when closing a single issue")
+		return nil, nil, fmt.Errorf("--continue only works when closing a single issue")
 	}
 	if in.suggestNext && len(args) > 1 {
-		FatalErrorRespectJSON("--suggest-next only works when closing a single issue")
+		return nil, nil, fmt.Errorf("--suggest-next only works when closing a single issue")
 	}
+	return &in, reasons, nil
+}
 
+func openCloseProxiedUOW(ctx context.Context) (uow.UnitOfWork, error) {
 	if uowProvider == nil {
-		FatalError("proxied-server UOW provider not initialized")
+		return nil, fmt.Errorf("proxied-server UOW provider not initialized")
 	}
 	uw, err := uowProvider.NewUOW(ctx)
 	if err != nil {
-		FatalErrorRespectJSON("open unit of work: %v", err)
+		return nil, fmt.Errorf("open unit of work: %v", err)
 	}
-	defer uw.Close(ctx)
+	return uw, nil
+}
 
+func processCloseProxiedIssues(ctx context.Context, uw uow.UnitOfWork, args []string, reasons []string, in *closeProxiedInput) ([]closeProxiedOutcome, []*types.Issue) {
 	outcomes := make([]closeProxiedOutcome, 0, len(args))
 	closedIssues := []*types.Issue{}
 	for i, id := range args {
 		reason := reasonForCloseIndex(reasons, i)
-		outcome, ok := closeProxiedOne(ctx, uw, id, reason, in)
+		outcome, ok := closeProxiedOne(ctx, uw, id, reason, *in)
 		if !ok {
 			continue
 		}
@@ -79,55 +107,61 @@ func runCloseProxiedServer(cmd *cobra.Command, ctx context.Context, args []strin
 		if in.jsonOut {
 			closedIssues = append(closedIssues, outcome.after)
 		} else {
-			fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), formatFeedbackID(outcome.after.ID, outcome.after.Title), reason)
+			fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("\u2713"), formatFeedbackID(outcome.after.ID, outcome.after.Title), reason)
 		}
 	}
+	return outcomes, closedIssues
+}
 
+func processCloseProxiedPostActions(ctx context.Context, uw uow.UnitOfWork, args []string, outcomes []closeProxiedOutcome, in *closeProxiedInput) ([]*types.Issue, *ContinueResult, *types.Issue) {
 	var unblocked []*types.Issue
 	if in.suggestNext && len(args) == 1 && len(outcomes) > 0 {
 		unblocked = closeProxiedSuggestNext(ctx, uw, args[0])
 	}
-
 	var continueResult *ContinueResult
 	if in.continueOn && len(args) == 1 && len(outcomes) > 0 {
 		continueResult = closeProxiedContinue(ctx, uw, args[0], !in.noAuto)
 	}
-
 	var claimedNextIssue *types.Issue
 	if in.claimNext && len(outcomes) > 0 && !in.continueOn {
 		claimedNextIssue = closeProxiedClaimNext(ctx, uw, in.jsonOut)
 	}
+	return unblocked, continueResult, claimedNextIssue
+}
 
-	if len(outcomes) > 0 {
-		msg := closeProxiedCommitMessage(outcomes, claimedNextIssue, continueResult)
-		if err := uw.Commit(ctx, msg); err != nil && !isDoltNothingToCommit(err) {
-			FatalErrorRespectJSON("commit close: %v", err)
+func commitCloseProxiedWithHooks(ctx context.Context, uw uow.UnitOfWork, outcomes []closeProxiedOutcome, claimedNextIssue *types.Issue, continueResult *ContinueResult) {
+	if len(outcomes) == 0 {
+		return
+	}
+	msg := closeProxiedCommitMessage(outcomes, claimedNextIssue, continueResult)
+	if err := uw.Commit(ctx, msg); err != nil && !isDoltNothingToCommit(err) {
+		FatalErrorRespectJSON("commit close: %v", err)
+	}
+	for _, o := range outcomes {
+		if !o.closed {
+			continue
 		}
-		for _, o := range outcomes {
-			if !o.closed {
-				continue
-			}
-			if err := fireProxiedCloseHooks(ctx, o.before, o.after); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: %s: %v\n", o.id, err)
-			}
+		if err := fireProxiedCloseHooks(ctx, o.before, o.after); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %s: %v\n", o.id, err)
 		}
 	}
+}
 
+func renderCloseProxiedOutput(outcomes []closeProxiedOutcome, closedIssues []*types.Issue, unblocked []*types.Issue, continueResult *ContinueResult, claimedNextIssue *types.Issue, in *closeProxiedInput) {
 	if !in.jsonOut {
 		if len(unblocked) > 0 {
 			fmt.Printf("\nNewly unblocked:\n")
 			for _, issue := range unblocked {
-				fmt.Printf("  • %s (P%d)\n", formatFeedbackID(issue.ID, issue.Title), issue.Priority)
+				fmt.Printf("  \u2022 %s (P%d)\n", formatFeedbackID(issue.ID, issue.Title), issue.Priority)
 			}
 		}
 		if continueResult != nil {
 			PrintContinueResult(continueResult)
 		}
 		if claimedNextIssue != nil {
-			fmt.Printf("%s Auto-claimed next ready issue: %s (P%d)\n", ui.RenderPass("✓"), formatFeedbackID(claimedNextIssue.ID, claimedNextIssue.Title), claimedNextIssue.Priority)
+			fmt.Printf("%s Auto-claimed next ready issue: %s (P%d)\n", ui.RenderPass("\u2713"), formatFeedbackID(claimedNextIssue.ID, claimedNextIssue.Title), claimedNextIssue.Priority)
 		}
 	}
-
 	if in.jsonOut && len(closedIssues) > 0 {
 		switch {
 		case len(unblocked) > 0:
@@ -139,10 +173,6 @@ func runCloseProxiedServer(cmd *cobra.Command, ctx context.Context, args []strin
 		default:
 			_ = outputJSON(closedIssues)
 		}
-	}
-
-	if len(args) > 0 && len(outcomes) == 0 {
-		os.Exit(1)
 	}
 }
 

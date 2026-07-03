@@ -83,6 +83,20 @@ func jsonStdoutError(message, hint string) {
 	_ = encoder.Encode(buildJSONError(message, hint))
 }
 
+
+func HandleStateDivergedError(extra string) error {
+	if jsonOutput {
+		jsonStdoutError("state diverged", "ERR_STATE_DIVERGED")
+	} else {
+		fmt.Fprintf(os.Stderr, "ERROR: state diverged")
+		if extra != "" {
+			fmt.Fprintf(os.Stderr, ": %s", extra)
+		}
+		fmt.Fprintf(os.Stderr, "\n")
+	}
+	return &exitError{Code: 1}
+}
+
 func HandleError(format string, args ...interface{}) error {
 	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
 	return &exitError{Code: 1}

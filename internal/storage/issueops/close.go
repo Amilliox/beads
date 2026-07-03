@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -16,8 +17,7 @@ type CloseResult struct {
 }
 
 // CloseIssueInTx closes an issue within a transaction, setting status to closed
-// and recording the close event. Routes to the correct table (issues/wisps)
-// automatically. The caller is responsible for Dolt versioning if needed.
+// and recording the close event. Routes to the correct table automatically.
 func CloseIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, session string) (*CloseResult, error) {
 	return closeIssueInTx(ctx, tx, id, reason, actor, session, true)
 }
@@ -26,7 +26,7 @@ func CloseIssueWithoutEventInTx(ctx context.Context, tx DBTX, id string, reason,
 	return closeIssueInTx(ctx, tx, id, reason, actor, session, false)
 }
 
-//nolint:gosec // G201: table names come from WispTableRouting (hardcoded constants)
+//nolint:gosec
 func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, session string, recordEvent bool) (*CloseResult, error) {
 	isWisp := IsActiveWispInTx(ctx, tx, id)
 	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
@@ -44,10 +44,11 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 
 	now := time.Now().UTC()
 
+	// Enhanced WHERE: close only if not already closed or pinned (GH#4517)
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE %s SET status = ?, closed_at = ?, updated_at = ?, close_reason = ?, closed_by_session = ?
-		WHERE id = ? AND status != ?
-	`, issueTable), types.StatusClosed, now, now, reason, session, id, types.StatusClosed)
+		WHERE id = ? AND status NOT IN ('%s','%s')
+	`, issueTable, types.StatusClosed, types.StatusPinned), types.StatusClosed, now, now, reason, session, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to close issue: %w", err)
 	}
@@ -67,10 +68,14 @@ func closeIssueInTx(ctx context.Context, tx DBTX, id string, reason, actor, sess
 		if qerr != nil {
 			return nil, fmt.Errorf("failed to check issue existence: %w", qerr)
 		}
-		if types.Status(status) == types.StatusClosed {
+		switch types.Status(status) {
+		case types.StatusClosed:
 			return &CloseResult{IsWisp: isWisp, AlreadyClosed: true}, nil
+		case types.StatusPinned:
+			return &CloseResult{IsWisp: isWisp, AlreadyClosed: true}, nil
+		default:
+			return nil, fmt.Errorf("close %s: %w (current status: %s)", id, storage.ErrStateDiverged, status)
 		}
-		return nil, fmt.Errorf("failed to close issue: %s", id)
 	}
 
 	if recordEvent {

@@ -33,6 +33,10 @@ var ErrNotInitialized = errors.New("database not initialized")
 // ErrPrefixMismatch is returned when an issue ID does not match the configured prefix.
 var ErrPrefixMismatch = errors.New("prefix mismatch")
 
+// ErrStateDiverged is returned when post-commit readback does not match the expected state.
+// Used by store.Store.RunWrite implementations for data integrity verification.
+var ErrStateDiverged = errors.New("state diverged: write verification failed")
+
 // Storage is the interface satisfied by *dolt.DoltStore.
 // Consumers depend on this interface rather than on the concrete type so that
 // alternative implementations (mocks, proxies, etc.) can be substituted.

@@ -47,7 +47,7 @@ func usesProxiedServer() bool {
 // Used by bd init and PersistentPreRun.
 func newDoltStore(ctx context.Context, cfg *dolt.Config) (storage.DoltStorage, error) {
 	if cfg.ProxiedServer {
-		// TODO: this should not be a store
+		// Proxied mode: store.Store is created via NewStoreFromUOW instead
 		// it should be a uow provider
 		return nil, fmt.Errorf("proxy server store should be uow provider")
 	}
@@ -93,7 +93,7 @@ func acquireEmbeddedLock(beadsDir string, serverMode bool) (util.Unlocker, error
 func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
-		// TODO: this needs to be uow provider
+		// Proxied mode: uowProvider + NewStoreFromUOW handles this
 		return nil, fmt.Errorf("proxy server store should be uow provider")
 		// 	return newProxiedServerStore(ctx, &dolt.Config{
 		// 		BeadsDir:      beadsDir,
@@ -166,7 +166,7 @@ func migrateHyphenatedDB(beadsDir string, cfg *configfile.Config, oldName, newNa
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err == nil && cfg != nil && cfg.IsDoltProxiedServerMode() {
-		// TODO: this needs to be uow provider
+		// Proxied mode: uowProvider + NewStoreFromUOW handles this
 		return nil, fmt.Errorf("proxy server store needs to be uow provider")
 		// return newProxiedServerStore(ctx, &dolt.Config{
 		// 	BeadsDir:      beadsDir,

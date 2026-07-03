@@ -2,6 +2,7 @@ package issueops
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -140,16 +141,13 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 	isWisp := IsActiveWispInTx(ctx, tx, id)
 	issueTable, _, eventTable, _ := WispTableRouting(isWisp)
 
-	// Read old issue inside the transaction for consistency.
+	// Read old issue inside the transaction for consistency (OCC read-before-write).
 	oldIssue, err := GetIssueInTx(ctx, tx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get issue for update: %w", err)
 	}
 
 	// Validate issue_type against built-in + custom types (GH#3030).
-	// This mirrors the create path (PrepareIssueForInsert → ValidateWithCustom)
-	// and reads custom types from the same transaction, so it works reliably
-	// even in subprocess contexts where the CLI-level store may be unavailable.
 	if rawType, ok := updates["issue_type"]; ok {
 		if issueType, ok := rawType.(string); ok {
 			customTypes, err := ResolveCustomTypesInTx(ctx, tx)
@@ -215,12 +213,40 @@ func updateIssueInTx(ctx context.Context, tx DBTX, id string, updates map[string
 	// Auto-manage started_at (set on transition to in_progress). (GH#2796)
 	setClauses, args = ManageStartedAt(oldIssue, updates, setClauses, args)
 
-	args = append(args, id)
+	// OCC: Include old updated_at in WHERE clause to detect concurrent modifications (GH#4517)
+	var expectedUpdatedAt interface{}
+	if !oldIssue.UpdatedAt.IsZero() {
+		expectedUpdatedAt = oldIssue.UpdatedAt
+	} else {
+		expectedUpdatedAt = nil
+	}
+	args = append(args, id, expectedUpdatedAt)
 
 	//nolint:gosec // G201: issueTable comes from WispTableRouting (hardcoded constants)
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ?", issueTable, strings.Join(setClauses, ", "))
-	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = ? AND updated_at = ?", issueTable, strings.Join(setClauses, ", "))
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
 		return nil, fmt.Errorf("failed to update issue: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+	if rows == 0 {
+		// Check: issue exists, but updated_at differs (race condition)
+		var currentUpdatedAt sql.NullTime
+		qerr := tx.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT updated_at FROM %s WHERE id = ?`, issueTable), id,
+		).Scan(&currentUpdatedAt)
+		if qerr == sql.ErrNoRows {
+			return nil, fmt.Errorf("issue not found: %s", id)
+		}
+		if qerr != nil {
+			return nil, fmt.Errorf("failed to check issue existence: %w", qerr)
+		}
+		return nil, fmt.Errorf("update %s: %w (expected updated_at: %v, current: %v)",
+			id, storage.ErrStateDiverged, expectedUpdatedAt, currentUpdatedAt)
 	}
 
 	if recordEvent {

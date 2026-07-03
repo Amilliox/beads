@@ -93,7 +93,7 @@ Examples:
 
 		combined := issue.Notes
 		if combined != "" {
-			combined += "\n"
+			combined += "\n---\n"
 		}
 		combined += noteText
 

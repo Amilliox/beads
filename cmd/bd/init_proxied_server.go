@@ -44,14 +44,8 @@ type initProxiedServerInput struct {
 }
 
 func runInitProxiedServer(cmd *cobra.Command, ctx context.Context, in initProxiedServerInput) error {
-	if in.fromJSONL {
-		return fmt.Errorf("--from-jsonl is not supported with --proxied-server")
-	}
-	if in.contributor {
-		return fmt.Errorf("--contributor is not supported with --proxied-server")
-	}
-	if in.team {
-		return fmt.Errorf("--team is not supported with --proxied-server")
+	if err := validateInitProxiedFlags(in); err != nil {
+		return err
 	}
 
 	if err := config.Initialize(); err != nil {
@@ -62,29 +56,13 @@ func runInitProxiedServer(cmd *cobra.Command, ctx context.Context, in initProxie
 		return err
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get current directory: %v", err)
-	}
-
-	fsProvider := fs.NewFileSystemProvider(cwd, newBeadsDirTemplates(), newFileSystemAdapters())
-	fsUseCase := fsProvider.BeadsDirFSUseCase()
-	gitUC := git.NewGitProvider(cwd).GitUseCase()
-
-	if in.stealth {
-		if err := fsUseCase.SetupStealthMode(ctx, !in.quiet); err != nil {
-			return fmt.Errorf("setting up stealth mode: %v", err)
-		}
-		in.skipHooks = true
-	}
-
-	prefix, err := resolveInitPrefix(in.prefix)
+	env, err := initProxiedEnvironment(ctx, in)
 	if err != nil {
 		return err
 	}
 
-	proxiedInit, err := fsUseCase.ResolveProxiedInit(ctx, domain.ResolveProxiedInitParams{
-		Prefix: prefix,
+	proxiedInit, err := env.fsUseCase.ResolveProxiedInit(ctx, domain.ResolveProxiedInitParams{
+		Prefix: env.prefix,
 		DBFlag: in.database,
 	})
 	if err != nil {
@@ -95,33 +73,119 @@ func runInitProxiedServer(cmd *cobra.Command, ctx context.Context, in initProxie
 	beadsDirIsLocal := proxiedInit.IsLocal
 	useLocalBeads := !hasExplicitBeadsDir || beadsDirIsLocal
 
-	if strings.Contains(filepath.Clean(cwd), string(filepath.Separator)+".beads"+string(filepath.Separator)) ||
-		strings.HasSuffix(filepath.Clean(cwd), string(filepath.Separator)+".beads") {
-		return fmt.Errorf("cannot initialize bd inside a .beads directory\nCurrent directory: %s", cwd)
+	if isInsideBeadsDir(env.cwd) {
+		return fmt.Errorf("cannot initialize bd inside a .beads directory\nCurrent directory: %s", env.cwd)
 	}
 
-	if !hasExplicitBeadsDir {
-		res, err := gitUC.EnsureGitRepo(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to initialize git repository: %v", err)
-		}
-		if res.DidInit && !in.quiet {
-			fmt.Printf("  %s Initialized git repository\n", ui.RenderPass("✓"))
-		}
+	if err := initProxiedGitRepo(ctx, env.gitUC, in, hasExplicitBeadsDir); err != nil {
+		return err
 	}
 
-	metadataBody, err := composeProxiedServerMetadataJSON(proxiedMetadataInputs{
-		dbName:    dbName,
-		projectID: projectID,
-	})
+	uowProvider, bootstrapParams, err := initProxiedBootstrap(ctx, in, env, beadsDir, dbName, projectID, env.prefix, useLocalBeads, beadsDirIsLocal)
 	if err != nil {
-		return fmt.Errorf("composing metadata.json: %v", err)
+		return err
+	}
+
+	if err := uow.RunInTx(ctx, uowProvider, "bd init", func(uw uow.UnitOfWork) error {
+		_, err := uw.BootstrapUseCase().BootstrapProject(ctx, bootstrapParams)
+		return err
+	}); err != nil {
+		return fmt.Errorf("init: %v", err)
+	}
+
+	return runInitProxiedServerTail(cmd, ctx, in, runInitTailContext{
+		beadsDir:      beadsDir,
+		prefix:        env.prefix,
+		dbName:        dbName,
+		useLocalBeads: useLocalBeads,
+		remoteURL:     bootstrapParams.RemoteURL,
+		fsUseCase:     env.fsUseCase,
+		gitUC:         env.gitUC,
+	})
+}
+
+// initProxiedEnv holds the common environment dependencies for init.
+type initProxiedEnv struct {
+	cwd      string
+	prefix   string
+	fsUseCase domain.BeadsDirFSUseCase
+	gitUC    domain.GitUseCase
+}
+
+func validateInitProxiedFlags(in initProxiedServerInput) error {
+	switch {
+	case in.fromJSONL:
+		return fmt.Errorf("--from-jsonl is not supported with --proxied-server")
+	case in.contributor:
+		return fmt.Errorf("--contributor is not supported with --proxied-server")
+	case in.team:
+		return fmt.Errorf("--team is not supported with --proxied-server")
+	}
+	return nil
+}
+
+func initProxiedEnvironment(ctx context.Context, in initProxiedServerInput) (*initProxiedEnv, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current directory: %v", err)
+	}
+
+	fsProvider := fs.NewFileSystemProvider(cwd, newBeadsDirTemplates(), newFileSystemAdapters())
+	fsUseCase := fsProvider.BeadsDirFSUseCase()
+	gitUC := git.NewGitProvider(cwd).GitUseCase()
+
+	if in.stealth {
+		if err := fsUseCase.SetupStealthMode(ctx, !in.quiet); err != nil {
+			return nil, fmt.Errorf("setting up stealth mode: %v", err)
+		}
+		in.skipHooks = true
+	}
+
+	prefix, err := resolveInitPrefix(in.prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	return &initProxiedEnv{
+		cwd:       cwd,
+		prefix:    prefix,
+		fsUseCase: fsUseCase,
+		gitUC:     gitUC,
+	}, nil
+}
+
+func isInsideBeadsDir(cwd string) bool {
+	sep := string(filepath.Separator)
+	return strings.Contains(filepath.Clean(cwd), sep+".beads"+sep) ||
+		strings.HasSuffix(filepath.Clean(cwd), sep+".beads")
+}
+
+func initProxiedGitRepo(ctx context.Context, gitUC domain.GitUseCase, in initProxiedServerInput, hasExplicitBeadsDir bool) error {
+	if hasExplicitBeadsDir {
+		return nil
+	}
+	res, err := gitUC.EnsureGitRepo(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to initialize git repository: %v", err)
+	}
+	if res.DidInit && !in.quiet {
+		fmt.Printf("  %s Initialized git repository\n", ui.RenderPass("✓"))
+	}
+	return nil
+}
+
+func initProxiedBootstrap(ctx context.Context, in initProxiedServerInput, env *initProxiedEnv,
+	beadsDir, dbName, projectID, prefix string, useLocalBeads, beadsDirIsLocal bool,
+) (uow.UnitOfWorkProvider, domain.BootstrapProjectParams, error) {
+	metadataBody, err := composeProxiedServerMetadataJSON(proxiedMetadataInputs{dbName: dbName, projectID: projectID})
+	if err != nil {
+		return nil, domain.BootstrapProjectParams{}, fmt.Errorf("composing metadata.json: %v", err)
 	}
 	configYAMLBody := renderInitConfigYAML("", false)
 
 	clientInfo, err := buildProxiedServerClientInfo(in.serverRootPath, in.serverConfigPath, in.serverLogPath, in.externalConfig)
 	if err != nil {
-		return err
+		return nil, domain.BootstrapProjectParams{}, err
 	}
 
 	fsParams := domain.InitializeBeadsDirParams{
@@ -135,9 +199,9 @@ func runInitProxiedServer(cmd *cobra.Command, ctx context.Context, in initProxie
 		fsParams.LocalVersion = Version
 	}
 
-	fsResult, err := fsUseCase.InitializeBeadsDir(ctx, fsParams)
+	fsResult, err := env.fsUseCase.InitializeBeadsDir(ctx, fsParams)
 	if err != nil {
-		return fmt.Errorf("initializing .beads directory: %v", err)
+		return nil, domain.BootstrapProjectParams{}, fmt.Errorf("initializing .beads directory: %v", err)
 	}
 	if fsResult.NoCOWErr != nil && !in.quiet {
 		fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", beadsDir, fsResult.NoCOWErr)
@@ -148,47 +212,35 @@ func runInitProxiedServer(cmd *cobra.Command, ctx context.Context, in initProxie
 
 	uowProvider, err := newProxiedServerUOWProvider(ctx, beadsDir)
 	if err != nil {
-		return fmt.Errorf("failed to open uow provider: %v", err)
+		return nil, domain.BootstrapProjectParams{}, fmt.Errorf("failed to open uow provider: %v", err)
 	}
 
-	bootstrapParams := domain.BootstrapProjectParams{
+	bootstrapParams := buildInitBootstrapParams(prefix, projectID, ctx, env.gitUC, in)
+	return uowProvider, bootstrapParams, nil
+}
+
+func buildInitBootstrapParams(prefix, projectID string, ctx context.Context, gitUC domain.GitUseCase, in initProxiedServerInput) domain.BootstrapProjectParams {
+	params := domain.BootstrapProjectParams{
 		Prefix:         prefix,
 		ProjectID:      projectID,
 		BdVersion:      Version,
 		LastImportTime: time.Now(),
 	}
-
 	if repoID, err := beads.ComputeRepoID(); err == nil {
-		bootstrapParams.RepoID = repoID
+		params.RepoID = repoID
 	} else if !in.quiet {
 		fmt.Fprintf(os.Stderr, "Warning: could not compute repository ID: %v\n", err)
 	}
 	if cloneID, err := beads.GetCloneID(); err == nil {
-		bootstrapParams.CloneID = cloneID
+		params.CloneID = cloneID
 	} else if !in.quiet {
 		fmt.Fprintf(os.Stderr, "Warning: could not compute clone ID: %v\n", err)
 	}
 	if remoteURL := resolveProxiedInitRemoteURL(ctx, gitUC, in); remoteURL != "" {
-		bootstrapParams.RemoteName = "origin"
-		bootstrapParams.RemoteURL = remoteURL
+		params.RemoteName = "origin"
+		params.RemoteURL = remoteURL
 	}
-
-	if err := uow.RunInTx(ctx, uowProvider, "bd init", func(uw uow.UnitOfWork) error {
-		_, err := uw.BootstrapUseCase().BootstrapProject(ctx, bootstrapParams)
-		return err
-	}); err != nil {
-		return fmt.Errorf("init: %v", err)
-	}
-
-	return runInitProxiedServerTail(cmd, ctx, in, runInitTailContext{
-		beadsDir:      beadsDir,
-		prefix:        prefix,
-		dbName:        dbName,
-		useLocalBeads: useLocalBeads,
-		remoteURL:     bootstrapParams.RemoteURL,
-		fsUseCase:     fsUseCase,
-		gitUC:         gitUC,
-	})
+	return params
 }
 
 func resolveInitPrefix(flagPrefix string) (string, error) {

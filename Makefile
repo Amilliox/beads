@@ -9,7 +9,7 @@ SHELL := $(subst cmd,bin,$(subst git.exe,bash.exe,$(GIT_BASH)))
 endif
 endif
 
-.PHONY: all build test test-icu-path test-full-cgo test-regression test-upgrade test-cross-version test-migration bench bench-quick clean clean-test-tmp install install-force help check-up-to-date fmt fmt-check check-testing-short
+.PHONY: all build test test-icu-path test-full-cgo test-regression oracle-a test-upgrade test-cross-version test-migration bench bench-quick clean clean-test-tmp install install-force help check-up-to-date fmt fmt-check check-testing-short
 .PHONY: ci-pr-core ci-pr-policy ci-pr-lint ci-package-mcp ci-package-npm ci-website
 
 # Default target
@@ -104,6 +104,12 @@ ci-website:
 test-regression:
 	@echo "Running regression tests (baseline vs candidate)..."
 	go test -tags=regression,$(BUILD_TAGS) -timeout=$(REGRESSION_TIMEOUT) -v ./tests/regression/...
+
+# Run Oracle A conformance harness (10 basic scenarios, exit+stdout comparison).
+# Builds both binaries, compares output with normalization.
+oracle-a: build
+	@echo "Running Oracle A conformance harness..."
+	@go test -tags=regression,$(BUILD_TAGS) -timeout=10m -run TestOracleA -count=1 -v ./tests/regression/...
 
 # Run upgrade smoke tests (release stability gate).
 # Tests that upgrading from previous release preserves data, role, and mode.

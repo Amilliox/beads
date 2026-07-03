@@ -340,6 +340,12 @@ func (w *workspace) runEnv() []string {
 			"BEADS_DOLT_PORT="+portStr,
 			"BEADS_DOLT_SERVER_PORT="+portStr,
 		)
+	} else if v := os.Getenv("BEADS_DOLT_PORT"); v != "" {
+		// Fallback: forward BEADS_DOLT_PORT from parent env when Docker is unavailable
+		env = append(env,
+			"BEADS_DOLT_PORT="+v,
+			"BEADS_DOLT_SERVER_PORT="+v,
+		)
 	}
 	if v := os.Getenv("TMPDIR"); v != "" {
 		env = append(env, "TMPDIR="+v)
